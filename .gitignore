@@ -132,4 +132,4 @@ post/
 *.user
 *.nupkg
 /Packages
-
+examples/NLG/data

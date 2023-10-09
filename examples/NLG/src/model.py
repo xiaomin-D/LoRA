@@ -79,6 +79,106 @@ class Conv1D(nn.Module):
         x = x.view(*size_out)
         return x
 
+class Attention_pos(nn.Module):
+    def __init__(self, nx, n_ctx, config, scale=False):
+        super(Attention, self).__init__()
+        n_state = nx  # in Attention: n_state=768 (nx=n_embd)
+        # [switch nx => n_state from Block to Attention to keep identical to TF implem]
+        
+        assert n_state % config.n_head == 0
+        self.register_buffer("bias", torch.tril(torch.ones(n_ctx, n_ctx)).view(1, 1, n_ctx, n_ctx))
+        self.n_head = config.n_head
+        self.split_size = n_state
+        self.scale = scale
+        self.c_attn = lora.MergedLinear(
+            nx, n_state * 3, 
+            r=config.lora_attn_dim, 
+            lora_alpha=config.lora_attn_alpha, 
+            lora_dropout=config.lora_dropout, 
+            enable_lora=[True, False, True], 
+            fan_in_fan_out=True,
+            merge_weights=False
+        )
+        self.c_proj = Conv1D(n_state, nx)
+
+        self.config = config
+    
+    def _attn(self, q, k, v, len_kv=None):
+        w = torch.matmul(q, k)
+        if self.scale:
+            w = w / math.sqrt(v.size(-1))
+        nd, ns = w.size(-2), w.size(-1)
+        b = self.bias[:, :, ns-nd:ns, :ns]
+        w = w * b - 1e10 * (1 - b)
+
+        # q : (batch, head, q_seq_length, head_features)
+        # k : (batch, head, head_features, kv_seq_length)
+        # w : (batch, head, q_seq_length, kv_seq_length)
+        # v : (batch, head, kv_seq_length, head_features)
+        if len_kv is not None:
+            _len = torch.arange(k.size(-1), device=k.device)
+            _input_msk =  _len[None, :] >= (len_kv)[:, None]
+            w = w.masked_fill(_input_msk.unsqueeze(1).unsqueeze(2), -1.0e10) 
+
+        w = nn.Softmax(dim=-1)(w)
+        return torch.matmul(w, v)
+
+    def merge_heads(self, x):
+        x = x.permute(0, 2, 1, 3).contiguous()
+        new_x_shape = x.size()[:-2] + (x.size(-2) * x.size(-1),)
+        return x.view(*new_x_shape)  # in Tensorflow implem: fct merge_states
+
+    def split_heads(self, x, k=False):
+        new_x_shape = x.size()[:-1] + (self.n_head, x.size(-1) // self.n_head)
+        x = x.view(*new_x_shape)  # in Tensorflow implem: fct split_states
+        if k:
+            return x.permute(0, 2, 3, 1).contiguous()  # (batch, head, head_features, seq_length)
+        else:
+            return x.permute(0, 2, 1, 3).contiguous()  # (batch, head, seq_length, head_features)
+
+    def forward(self, x, history=None, layer_past=None, len_past=None):
+        hidden_states = x
+
+        x = self.c_attn(x)
+        query, key, value = x.split(self.split_size, dim=2)
+
+        query = self.split_heads(query)
+        key = self.split_heads(key, k=True)
+        value = self.split_heads(value)
+
+        #_input_msk = None
+
+        len_kv = None
+
+        if layer_past is not None:
+            # key : (batch, head, head_features, seq_length)
+            # value : (batch, head, seq_length, head_features)
+            # layer_past, key : (batch, head, seq_length, head_features)
+            if len_past is None:
+                past_key, past_value = layer_past[0].transpose(-2, -1), layer_past[1]  # transpose back cf below
+                key = torch.cat((past_key, key), dim=-1)
+                value = torch.cat((past_value, value), dim=-2)
+            else:
+                key_seq = key.shape[-1]
+                assert key_seq == 1
+
+                _batch = torch.arange(0, key.shape[0], dtype=torch.long, device=key.device)
+
+                past_key, past_value = layer_past[0], layer_past[1]
+
+                past_key[_batch,:,len_past,:] = key.squeeze(-1)
+                past_value[_batch,:,len_past,:] = value.squeeze(-2)
+
+                key = past_key.transpose(-2, -1)
+                value = past_value
+
+                len_kv = len_past + 1
+
+        present = torch.stack((key.transpose(-2, -1), value))  # transpose to have same shapes for stacking
+        a = self._attn(query, key, value, len_kv = len_kv)
+        a = self.merge_heads(a)
+        a = self.c_proj(a)
+        return a, present
 
 class Attention(nn.Module):
     def __init__(self, nx, n_ctx, config, scale=False):
@@ -352,6 +452,7 @@ class GPT2LMModel(nn.Module):
         hidden_states, presents = self.transformer(input_ids, past=past, len_past=len_past)
 
         # batch, seq, vocab
+        # breakpoint()
         lm_logits = self.lm_head(hidden_states)
 
         if lm_labels is not None:
